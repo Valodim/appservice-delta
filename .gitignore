@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+/build
+
+# ignore vi temporaries
+*~
+*.swp
+*.swo
+
+.DS_Store
+
+# directories used for local dev
+/data
+/synapse
+
+appservice-registration-delta.yaml

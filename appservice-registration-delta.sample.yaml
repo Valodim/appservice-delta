@@ -1,0 +1,11 @@
+hs_token: cd609b54d5f745128c6a6b5887fb6a6d
+as_token: ff24bd5c0a334526930a3d4c07c3e464
+namespaces:
+    users:
+    - regex: '@.+_at_.+'
+      exclusive: true
+id: delta
+rate_limited: false
+sender_localpart: delta
+url: http://localhost:8008
+
