@@ -15,6 +15,7 @@ lto = true
 deltachat = { path = "./deltachat-core-rust", features = ["repl"] }
 matrix-sdk-appservice = { path = "./matrix-rust-sdk/crates/matrix-sdk-appservice" }
 matrix-sdk = { version = "0.4", path = "./matrix-rust-sdk/crates/matrix-sdk", default-features = false, features = ["appservice"] }
+dashmap = "4"
 
 shell-words = "1"
 

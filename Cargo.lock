@@ -132,6 +132,7 @@ dependencies = [
  "anyhow",
  "async-std",
  "criterion",
+ "dashmap",
  "deltachat",
  "futures-lite",
  "log",
