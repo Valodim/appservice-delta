@@ -1,27 +1,20 @@
-use deltachat::constants::Viewtype;
-use deltachat::mimeparser::SystemMessage;
-use matrix_sdk::{
-    ruma::{
-        api::client::r0::message::send_message_event,
-        events::{room::message::RoomMessageEventContent, MessageEventContent},
-        serde::Raw,
-        RoomId,
-    },
-    uuid::Uuid,
-    Client, Result,
-};
+use std::{convert::TryInto, io::BufReader};
 
-use crate::types;
+use deltachat::{constants::Viewtype, dc_tools::dc_open_file_std};
+use matrix_sdk::{Client, Result, ruma::{MxcUri, RoomId, api::client::r0::message::send_message_event, events::{MessageEventContent, room::{ImageInfo, message::{ImageMessageEventContent, MessageType, RoomMessageEventContent}}}, serde::Raw}, uuid::Uuid};
+
+use crate::{types, DeltaAppservice};
 
 pub async fn send_delta_message(
+    da: &DeltaAppservice,
     client: &Client,
     room_id: &RoomId,
     message: deltachat::message::Message,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     if message.is_system_message() {
         send_delta_system_message(client, room_id, message).await
     } else {
-        send_delta_plain_message(client, room_id, message).await
+        send_delta_plain_message(da, client, room_id, message).await
     }
 }
 
@@ -29,37 +22,74 @@ async fn send_delta_system_message(
     _client: &Client,
     _room_id: &RoomId,
     message: deltachat::message::Message,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     log::info!("skipping system message: {:?}", message);
     Ok(())
 }
 
 async fn send_delta_plain_message(
+    da: &DeltaAppservice,
     client: &Client,
     room_id: &RoomId,
     message: deltachat::message::Message,
-) -> Result<()> {
-    let msg = match message.get_viewtype() {
-        /*
+) -> anyhow::Result<()> {
+    match message.get_viewtype() {
         Viewtype::Image | Viewtype::Gif => {
-            let mime = message.get_filemime().unwrap();
-            let path = message.get_filename().unwrap();
-            let f = File::open(path).unwrap();
+            if let Some((image_uri, image_info)) = upload_delta_image(da, client, &message).await? {
+                let content = RoomMessageEventContent::new(MessageType::Image(
+                    ImageMessageEventContent::plain(
+                        message.get_filename().unwrap_or_default(),
+                        image_uri,
+                        Some(Box::new(image_info)),
+                    ),
+                ));
+                send_delta_plain_message_content(client, room_id, &message, content).await?;
+            }
+
+            let content =
+                RoomMessageEventContent::text_plain(message.get_text().unwrap_or_default());
+            send_delta_plain_message_content(client, room_id, &message, content).await?;
+        }
+        Viewtype::Text => {
+            let content =
+                RoomMessageEventContent::text_plain(message.get_text().unwrap_or_default());
+            send_delta_plain_message_content(client, room_id, &message, content).await?;
+        }
+        other => {
+            RoomMessageEventContent::notice_plain(format!("(unhandled view type: {})", other));
+        }
+    };
+    Ok(())
+}
+
+async fn upload_delta_image(
+    da: &DeltaAppservice,
+    client: &Client,
+    message: &deltachat::message::Message,
+) -> anyhow::Result<Option<(MxcUri, ImageInfo)>> {
+    if let Some(mime) = message.get_filemime() {
+        if let Some(filename) = message.get_file(&da.ctx) {
+            let f = dc_open_file_std(&da.ctx, filename)?;
             let mut reader = BufReader::new(f);
             let response = client.upload(&mime.parse().unwrap(), &mut reader).await?;
-            let msgtype = ImageMessageEventContent::plain(
-                message.get_text().unwrap_or_default().to_owned(),
-                response.content_uri,
-                None,
-            );
-            RoomMessageEventContent::new(MessageType::Image(msgtype))
+
+            let mut image_info = ImageInfo::new();
+            image_info.mimetype = Some(mime);
+            image_info.width = Some(message.get_width().try_into().unwrap());
+            image_info.height = Some(message.get_height().try_into().unwrap());
+            image_info.size = Some(message.get_filebytes(&da.ctx).await.try_into().unwrap());
+            return Ok(Some((response.content_uri, image_info)));
         }
-        */
-        Viewtype::Text => {
-            RoomMessageEventContent::text_plain(message.get_text().unwrap_or_default())
-        }
-        other => RoomMessageEventContent::notice_plain(format!("(unhandled view type: {}", other)),
-    };
+    }
+    Ok(None)
+}
+
+async fn send_delta_plain_message_content(
+    client: &Client,
+    room_id: &RoomId,
+    message: &deltachat::message::Message,
+    msg: RoomMessageEventContent,
+) -> Result<()> {
     let content = types::DeltaRoomMessageEventContent {
         delta_fields: Some(types::DeltaMessageFields {
             external_url: Some(format!("mid:{}", message.get_rfc724_mid())),
@@ -68,7 +98,6 @@ async fn send_delta_plain_message(
         }),
         msg,
     };
-
     send_message(client, room_id, content).await
 }
 

@@ -4,19 +4,20 @@ use std::{path::Path, time::Duration};
 use std::convert::{TryFrom, TryInto};
 
 use async_std::task;
-use deltachat::constants::DC_CONTACT_ID_SELF;
+use deltachat::chat::ChatItem;
+use deltachat::constants::{Chattype, DC_CONTACT_ID_SELF};
 use log::info;
 
 use deltachat::{
     chat::{Chat, ChatId},
     config::Config,
-    constants::Chattype,
     contact::Contact,
     context::Context,
     message::{self, MsgId},
     EventType,
 };
 
+use matrix_sdk::ruma::api::client::r0::membership::{kick_user, leave_room};
 use matrix_sdk::{
     event_handler::Ctx,
     room::{Joined, Room},
@@ -49,7 +50,7 @@ mod intent;
 mod types;
 
 #[derive(Debug, Clone)]
-struct DeltaAppservice {
+pub struct DeltaAppservice {
     ctx: Context,
     appservice: AppService,
     client_cache: Arc<DashMap<u32, Client>>,
@@ -87,12 +88,24 @@ impl DeltaAppservice {
         self.appservice.get_cached_client(None).unwrap()
     }
 
+    pub async fn get_owner_user_id(&self) -> UserId {
+        self.ctx.get_ui_config("ui.appservice.owner_user_id").await.unwrap().unwrap().try_into().unwrap()
+    }
+
+    pub async fn set_owner_user_id(&self, owner_user_id: &UserId) -> anyhow::Result<()> {
+        self.ctx.set_ui_config("ui.appservice.owner_user_id", Some(&owner_user_id.to_string())).await
+    }
+
     pub async fn get_control_room_id(&self) -> Option<RoomId> {
         self.ctx
             .get_ui_config("ui.appservice.control_room_id")
             .await
             .unwrap()
             .map(|raw_id| RoomId::try_from(raw_id).unwrap())
+    }
+
+    pub async fn set_control_room_id(&self, control_room_id: &RoomId) -> anyhow::Result<()> {
+        self.ctx.set_ui_config("ui.appservice.control_room_id", Some(&control_room_id.to_string())).await
     }
 
     pub async fn set_repl_active_chat_id(&self, chat_id: ChatId) {
@@ -194,20 +207,22 @@ impl DeltaAppservice {
         .and_then(|r| RoomId::try_from(r).ok())
     }
 
-    pub async fn get_email_user_by_id(&self, contact_id: u32) -> Result<(Contact, Client)> {
+    pub async fn get_email_user_by_id(
+        &self,
+        contact_id: u32,
+        refresh: bool,
+    ) -> Result<(Contact, Client)> {
         let contact = Contact::load_from_db(&self.ctx, contact_id).await.unwrap();
-        let client = self.get_email_user(&contact).await.unwrap();
+        let client = self.get_email_user(&contact, refresh).await.unwrap();
 
         Ok((contact, client))
     }
 
-    pub async fn get_email_user(&self, contact: &Contact) -> anyhow::Result<Client> {
-        if contact.id == DC_CONTACT_ID_SELF {
-            anyhow::bail!("Tried to get email user for self");
-        }
-
-        if let Some(client) = self.client_cache.get(&contact.id) {
-            return Ok(client.clone());
+    pub async fn get_email_user(&self, contact: &Contact, refresh: bool) -> anyhow::Result<Client> {
+        if !refresh {
+            if let Some(client) = self.client_cache.get(&contact.id) {
+                return Ok(client.clone());
+            }
         }
 
         let localpart = addr_to_localpart(contact.get_addr());
@@ -219,7 +234,10 @@ impl DeltaAppservice {
 
         let client = self.appservice.virtual_user_client(&localpart).await?;
 
-        let desired_display_name = contact.get_name_n_addr();
+        let desired_display_name = match contact.get_id() {
+            DC_CONTACT_ID_SELF => self.ctx.get_config(Config::Displayname).await?.unwrap_or("Me".to_owned()),
+            _ => contact.get_display_name().to_owned(),
+        };
         if client
             .display_name()
             .await?
@@ -236,16 +254,18 @@ impl DeltaAppservice {
                     .invite_user_by_id(&client.user_id().await.unwrap())
                     .await
                 {
-                    log::error!("{}", x);
+                    log::debug!("{}", x);
                 }
             }
             if client.get_joined_room(control_room.room_id()).is_none() {
                 // ignore result, if already joined TODO improve with room sync
                 if let Err(x) = client.join_room_by_id(control_room.room_id()).await {
-                    log::error!("{}", x);
+                    log::debug!("{}", x);
                 }
             }
         }
+
+        self.client_cache.insert(contact.id, client.clone());
 
         Ok(client)
     }
@@ -255,31 +275,26 @@ async fn handle_room_member_event(
     da: DeltaAppservice,
     room: Room,
     ev: SyncRoomMemberEvent,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     let user_id = UserId::try_from(ev.state_key.as_str())?;
     let is_main_user = user_id.localpart() == da.appservice.registration().sender_localpart;
     let is_appservice_user = da.appservice.user_id_is_in_namespace(user_id)?;
 
     if is_main_user && ev.content.membership == MembershipState::Invite {
-        return handle_room_main_user_invited(da, room).await;
+        handle_room_main_user_invited(da, room, &ev.sender).await?;
     } else if !is_appservice_user && ev.content.membership == MembershipState::Leave {
-        return handle_room_user_leave(da, room).await;
+        handle_room_user_leave(da, room).await?;
     }
 
     Ok(())
 }
 
-async fn handle_room_main_user_invited(da: DeltaAppservice, room: Room) -> Result<()> {
+async fn handle_room_main_user_invited(da: DeltaAppservice, room: Room, sender: &UserId) -> anyhow::Result<()> {
     let client = da.appservice.get_cached_client(None)?;
 
     client.join_room_by_id(room.room_id()).await?;
-    da.ctx
-        .set_ui_config(
-            "ui.appservice.control_room_id",
-            Some(&room.room_id().to_string()),
-        )
-        .await
-        .unwrap();
+    da.set_control_room_id(room.room_id()).await?;
+    da.set_owner_user_id(sender).await?;
 
     Ok(())
 }
@@ -287,24 +302,25 @@ async fn handle_room_main_user_invited(da: DeltaAppservice, room: Room) -> Resul
 async fn handle_room_user_leave(da: DeltaAppservice, room: Room) -> Result<()> {
     if let Some(chat_id) = da.get_chat_id_by_room_id(room.room_id()).await {
         da.clear_room_id_and_chat_id(room.room_id(), chat_id).await;
-        clear_room(&da.appservice, room).await.unwrap();
+        clear_room(&da, room).await.unwrap();
     }
 
     Ok(())
 }
 
-async fn clear_room(_appservice: &AppService, _room: Room) -> Result<()> {
-    // TODO fix
-    /*
+async fn clear_room(da: &DeltaAppservice, room: Room) -> Result<()> {
     for m in room.joined_members().await? {
-        if appservice.user_id_is_in_namespace(m.user_id())? {
-            if let Ok(client) = appservice.virtual_user_client(m.user_id().localpart()).await {
+        if da.appservice.user_id_is_in_namespace(m.user_id())? {
+            if let Ok(client) = da.appservice.virtual_user_client(m.user_id().localpart()).await {
                 let request = leave_room::Request::new(room.room_id());
                 client.send(request, None).await.unwrap();
             }
         }
     }
-    */
+
+    let main_user = da.get_main_user();
+    let request = leave_room::Request::new(room.room_id());
+    main_user.send(request, None).await.unwrap();
 
     Ok(())
 }
@@ -368,6 +384,7 @@ async fn handle_control_room_message(
     match cmd {
         "repl" => handle_control_room_command_repl(da, room, args).await,
         "configure" => handle_control_room_command_configure(da, room, args).await,
+        "room" => handle_control_room_command_room(da, room, args).await,
         _ => {
             let msg = RoomMessageEventContent::text_plain(format!(
                 "Unknown command {}. Commands:\n - repl\n - configure",
@@ -377,6 +394,42 @@ async fn handle_control_room_message(
             Ok(())
         }
     }
+}
+
+async fn handle_control_room_command_room(
+    da: DeltaAppservice,
+    control_room: Joined,
+    arguments: &str,
+) -> Result<()> {
+    if !da.ctx.is_configured().await.unwrap() {
+        let msg = RoomMessageEventContent::text_plain("Not configured.");
+        control_room.send(msg, None).await?;
+        return Ok(());
+    }
+
+    match arguments.parse::<u32>() {
+        Ok(chat_id) => {
+            let chat_id = ChatId::new(chat_id);
+            if let Some(room_id) = da.get_room_id_by_chat_id(chat_id).await {
+                let msg = RoomMessageEventContent::text_plain(format!(
+                    "Chat is already a room: {}",
+                    room_id
+                ));
+                control_room.send(msg, None).await?;
+                return Ok(());
+            }
+
+            let owner_user_id = da.get_owner_user_id().await;
+            let chat = Chat::load_from_db(&da.ctx, chat_id).await.unwrap();
+            create_room_for_group_chat(da, control_room, owner_user_id, chat).await.unwrap();
+        }
+        Err(_) => {
+            let msg = RoomMessageEventContent::text_plain("room <chat_id>");
+            control_room.send(msg, None).await?;
+        }
+    };
+
+    Ok(())
 }
 
 async fn handle_control_room_command_configure(
@@ -407,6 +460,7 @@ async fn handle_control_room_command_configure(
             (Config::SendServer, args.get(5).map(String::as_str)),
             (Config::E2eeEnabled, Some("0")),
             (Config::ShowEmails, Some("2")),
+            (Config::BccSelf, Some("1")),
         ] {
             da.ctx.set_config(k, v).await.unwrap();
         }
@@ -576,7 +630,7 @@ async fn handle_control_room_reaction_thumbsup(
     da: DeltaAppservice,
     control_room: Joined,
     react_sender: UserId,
-    original_sender: UserId,
+    _original_sender: UserId,
     original_chat_id: ChatId,
 ) -> Result<()> {
     if da.get_room_id_by_chat_id(original_chat_id).await.is_some() {
@@ -586,6 +640,9 @@ async fn handle_control_room_reaction_thumbsup(
     }
 
     let original_chat = Chat::load_from_db(&da.ctx, original_chat_id).await.unwrap();
+    create_room_for_group_chat(da, control_room, react_sender, original_chat).await
+
+    /* TODO treat single chats as direct rooms?
     match original_chat.get_type() {
         Chattype::Single => {
             create_room_for_single_chat(
@@ -609,39 +666,7 @@ async fn handle_control_room_reaction_thumbsup(
             Ok(())
         }
     }
-}
-
-async fn create_room_for_single_chat(
-    da: DeltaAppservice,
-    _control_room: Joined,
-    react_sender: UserId,
-    original_sender: UserId,
-    original_chat: Chat,
-) -> Result<()> {
-    let invite_users = vec![react_sender.clone()];
-
-    let create_client = da
-        .appservice
-        .virtual_user_client(original_sender.localpart())
-        .await?;
-
-    let mut r = CreateRoomRequest::new();
-    r.preset = Some(RoomPreset::TrustedPrivateChat);
-    r.is_direct = true;
-    r.topic = Some(original_chat.get_name());
-    r.invite = invite_users.as_slice();
-
-    let response = create_client.create_room(r).await.unwrap();
-
-    original_chat.get_id().accept(&da.ctx).await.unwrap();
-    da.set_room_id_with_chat_id(&response.room_id, original_chat.get_id())
-        .await;
-
-    backfill_chat(da, response.room_id, original_chat.get_id())
-        .await
-        .unwrap();
-
-    Ok(())
+    */
 }
 
 async fn create_room_for_group_chat(
@@ -651,50 +676,71 @@ async fn create_room_for_group_chat(
     chat: Chat,
 ) -> Result<()> {
     let mut invite_user_ids = Vec::new();
+    let mut invite_clients = Vec::new();
     for cid in deltachat::chat::get_chat_contacts(&da.ctx, chat.get_id())
         .await
         .unwrap()
         .into_iter()
-        .filter(|c| *c != DC_CONTACT_ID_SELF)
     {
         let contact = Contact::get_by_id(&da.ctx, cid).await.unwrap();
-        let client = da.get_email_user(&contact).await.unwrap();
+        let client = da.get_email_user(&contact, false).await.unwrap();
         invite_user_ids.push(client.user_id().await.unwrap());
+        invite_clients.push(client);
     }
     invite_user_ids.push(react_sender.clone());
 
     let mut r = CreateRoomRequest::new();
     r.preset = Some(RoomPreset::TrustedPrivateChat);
-    r.is_direct = false;
-    r.topic = Some(chat.get_name());
-    r.name = Some(chat.get_name().try_into().unwrap());
+    if chat.get_type() == Chattype::Single {
+        r.is_direct = true;
+        r.name = Some(chat.get_name().try_into().unwrap());
+
+        // the self contact is not in chats with type single, so we add it manually
+        let contact = Contact::get_by_id(&da.ctx, DC_CONTACT_ID_SELF).await.unwrap();
+        let client = da.get_email_user(&contact, false).await.unwrap();
+        invite_user_ids.push(client.user_id().await.unwrap());
+        invite_clients.push(client);
+    } else {
+        r.name = Some(chat.get_name().try_into().unwrap());
+        r.topic = Some(chat.get_name());
+    }
     r.invite = invite_user_ids.as_slice();
 
     let create_client = da.get_main_user();
     let response = create_client.create_room(r).await.unwrap();
 
+    for client in invite_clients {
+        client.join_room_by_id(&response.room_id).await.unwrap();
+    }
+
     chat.get_id().accept(&da.ctx).await.unwrap();
     da.set_room_id_with_chat_id(&response.room_id, chat.get_id())
         .await;
 
-    backfill_chat(da, response.room_id, chat.get_id()).await.unwrap();
+    backfill_chat(da, response.room_id, chat.get_id())
+        .await
+        .unwrap();
 
     Ok(())
 }
 
-async fn backfill_chat(_da: DeltaAppservice, _room_id: RoomId, _chat_id: ChatId) -> Result<()> {
-    // TODO
-
-    /*
-     let msglist = deltachat::chat::get_chat_msgs(&da.ctx, chat_id, 0, None).await.unwrap();
-     for msg in msglist {
-         if let ChatItem::Message { msg_id } = msg {
-             let msg = message::Message::load_from_db(&da.ctx, msg_id).await.unwrap();
-             let (_, client) = da.get_email_user_by_id(msg.get_from_id()).await?;
-             intent::send_delta_message(&client, &room_id, msg).await?
-         }
+async fn backfill_chat(
+    da: DeltaAppservice,
+    room_id: RoomId,
+    chat_id: ChatId,
+) -> anyhow::Result<()> {
+    let msglist = deltachat::chat::get_chat_msgs(&da.ctx, chat_id, 0, None)
+        .await
+        .unwrap();
+    for msg in msglist {
+        if let ChatItem::Message { msg_id } = msg {
+            let msg = message::Message::load_from_db(&da.ctx, msg_id)
+                .await
+                .unwrap();
+            let (_, client) = da.get_email_user_by_id(msg.get_from_id(), false).await?;
+            intent::send_delta_message(&da, &client, &room_id, msg).await?
+        }
     }
-    */
 
     Ok(())
 }
@@ -756,15 +802,20 @@ async fn callback_delta_event(da: DeltaAppservice, event: EventType) {
                 .await
                 .unwrap();
         }
-        // TODO read markers
-        // EventType::MsgDelivered { chat_id, msg_id } => {
-        //  log::info!("{:?}", event);
-        // }
+        EventType::MsgDelivered { chat_id, msg_id } => {
+            log::info!("{:?}", event);
+            handle_chat_delivered_message(da, chat_id, msg_id)
+                .await
+                .unwrap();
+        }
         EventType::MsgFailed { chat_id, msg_id } => {
             log::info!("{:?}", event);
             handle_chat_failed_message(da, chat_id, msg_id)
                 .await
                 .unwrap();
+        }
+        EventType::ContactsChanged(Some(contact_id)) => {
+            handle_contact_changed(da, contact_id).await.unwrap();
         }
         EventType::Info(msg) => {
             log::info!("{}", msg);
@@ -781,24 +832,45 @@ async fn callback_delta_event(da: DeltaAppservice, event: EventType) {
     }
 }
 
+async fn handle_contact_changed(da: DeltaAppservice, contact_id: u32) -> anyhow::Result<()> {
+    da.get_email_user_by_id(contact_id, true).await?;
+    Ok(())
+}
+
+async fn handle_chat_delivered_message(
+    da: DeltaAppservice,
+    chat_id: ChatId,
+    _msg_id: MsgId,
+) -> anyhow::Result<()> {
+    if let Some(room_id) = da.get_room_id_by_chat_id(chat_id).await {
+        if let Some(_room) = da.get_main_user().get_joined_room(&room_id) {
+            // TODO where to get event from?
+            // room.read_marker(fully_read, read_receipt)
+        }
+    }
+    Ok(())
+}
+
 async fn handle_chat_incoming_message(
     da: DeltaAppservice,
     chat_id: ChatId,
     msg_id: MsgId,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     if let Some(control_room_id) = da.get_control_room_id().await {
         let message = message::Message::load_from_db(&da.ctx, msg_id)
             .await
             .unwrap();
         // let text = message::get_msg_info(&delta.ctx, msg_id).await.unwrap();
-        let (_, user_client) = da.get_email_user_by_id(message.get_from_id()).await?;
+        let (_, user_client) = da
+            .get_email_user_by_id(message.get_from_id(), false)
+            .await?;
 
         let room_id = da
             .get_room_id_by_chat_id(chat_id)
             .await
             .unwrap_or_else(|| control_room_id);
 
-        intent::send_delta_message(&user_client, &room_id, message).await?
+        intent::send_delta_message(&da, &user_client, &room_id, message).await?
     } else {
         log::error!("no control room registered");
     }
@@ -815,7 +887,9 @@ async fn handle_chat_failed_message(
     let message = message::Message::load_from_db(&da.ctx, msg_id)
         .await
         .unwrap();
-    let (_, user_client) = da.get_email_user_by_id(message.get_from_id()).await?;
+    let (_, user_client) = da
+        .get_email_user_by_id(message.get_from_id(), false)
+        .await?;
 
     let control_room_id = da.get_control_room_id().await;
     let room_id = da
