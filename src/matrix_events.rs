@@ -2,26 +2,10 @@ use std::convert::TryFrom;
 
 use anyhow::Result;
 use deltachat::{chat::ChatId, config::Config, constants::Viewtype};
-use matrix_sdk::{
-    room::{Joined, Room},
-    ruma::{
-        events::{
-            reaction::{self, ReactionEventContent, SyncReactionEvent},
-            room::{
-                member::{MembershipState, SyncRoomMemberEvent},
-                message::{
+use matrix_sdk::{room::{Joined, Room}, ruma::{EventId, UserId, events::{MessageEvent, reaction::{self, ReactionEventContent, SyncReactionEvent}, room::{avatar::RoomAvatarEventContent, member::{MembershipState, SyncRoomMemberEvent}, message::{
                     self, MessageType, RoomMessageEventContent, SyncRoomMessageEvent,
                     TextMessageEventContent,
-                },
-                name::RoomNameEventContent,
-                topic::SyncRoomTopicEvent,
-            },
-            MessageEvent,
-        },
-        identifiers::RoomNameBox,
-        EventId, UserId,
-    },
-};
+                }, name::RoomNameEventContent, topic::SyncRoomTopicEvent}}, identifiers::RoomNameBox}};
 
 use crate::{
     cmdline, matrix_intents,
@@ -152,8 +136,7 @@ async fn handle_control_room_command_message(
 ) -> anyhow::Result<()> {
     let args = shell_words::split(arguments).expect("must parse");
     if args.len() < 1 || !deltachat::contact::may_be_valid_addr(&args[0]) {
-        let msg =
-            RoomMessageEventContent::text_plain("Usage: message <email> [full_name]");
+        let msg = RoomMessageEventContent::text_plain("Usage: message <email> [full_name]");
         control_room.send(msg, None).await?;
         return Ok(());
     }
@@ -457,9 +440,23 @@ async fn handle_room_main_user_invited(
     da.set_control_room_id(room.room_id()).await?;
     da.set_owner_user_id(sender).await?;
 
-    let topic_event = RoomNameEventContent::new(RoomNameBox::try_from("Delta Control Room").ok());
+    main_user.set_display_name(Some("Delta Appservice")).await?;
+
+    let mut image = std::fs::File::open("./delta.png").unwrap();
+    let response = main_user.upload(&"image/png".parse().unwrap(), &mut image).await?;
+    let avatar_uri = response.content_uri;
+    main_user.set_avatar_url(Some(&avatar_uri)).await?;
+
+    let space_room_id = matrix_intents::create_space(&da, Some(avatar_uri.clone())).await?;
+    da.set_space_room_id(&space_room_id).await?;
+
     if let Some(room) = main_user.get_joined_room(room.room_id()) {
+        let topic_event = RoomNameEventContent::new(RoomNameBox::try_from("Control Room").ok());
         room.send_state_event(topic_event, "").await?;
+
+        let mut avatar_event = RoomAvatarEventContent::new();
+        avatar_event.url = Some(avatar_uri);
+        room.send_state_event(avatar_event, "").await?;
     }
 
     Ok(())

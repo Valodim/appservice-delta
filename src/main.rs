@@ -31,6 +31,7 @@ mod cmdline;
 mod delta_events;
 mod matrix_events;
 mod matrix_intents;
+mod compat;
 mod types;
 mod util;
 
@@ -135,9 +136,54 @@ impl DeltaAppservice {
         let main_user = self.get_main_user();
         if let Some(control_room_id) = control_room_id {
             log::info!("control room: {}", control_room_id);
-            main_user.get_joined_room(&control_room_id)
+            let room = main_user.get_joined_room(&control_room_id);
+            if room.is_none() {
+                log::debug!("fetching control room state");
+                compat::fetch_initial_room_state(&main_user, &control_room_id)
+                    .await
+                    .unwrap();
+                return main_user.get_joined_room(&control_room_id);
+            }
+            room
         } else {
             log::warn!("no control room configured!");
+            None
+        }
+    }
+
+    pub async fn set_space_room_id(&self, space_room_id: &RoomId) -> anyhow::Result<()> {
+        self.ctx
+            .set_ui_config(
+                "ui.appservice.space_room_id",
+                Some(&space_room_id.to_string()),
+            )
+            .await
+    }
+
+    pub async fn get_space_room_id(&self) -> Option<RoomId> {
+        self.ctx
+            .get_ui_config("ui.appservice.space_room_id")
+            .await
+            .unwrap()
+            .map(|raw_id| RoomId::try_from(raw_id).unwrap())
+    }
+
+    pub async fn get_space_room(&self) -> Option<Joined> {
+        let space_room_id = self.get_space_room_id().await;
+        let main_user = self.get_main_user();
+        if let Some(space_room_id) = space_room_id {
+            log::info!("space room: {}", space_room_id);
+            let room = main_user.get_joined_room(&space_room_id);
+            if room.is_none() {
+                log::debug!("fetching control room state");
+                compat::fetch_initial_room_state(&main_user, &space_room_id)
+                    .await
+                    .unwrap();
+                return main_user.get_joined_room(&space_room_id);
+            }
+            room
+        } else {
+            log::warn!("no space room configured!");
             None
         }
     }
@@ -245,7 +291,7 @@ impl DeltaAppservice {
         }
 
         if let Some(control_room) = self.get_control_room().await {
-            if client.get_invited_room(control_room.room_id()).is_none() {
+            if client.get_joined_room(control_room.room_id()).is_none() {
                 // ignore result, if already invited TODO improve with room sync
                 if let Err(x) = control_room
                     .invite_user_by_id(&client.user_id().await.unwrap())
@@ -253,10 +299,22 @@ impl DeltaAppservice {
                 {
                     log::debug!("{}", x);
                 }
-            }
-            if client.get_joined_room(control_room.room_id()).is_none() {
-                // ignore result, if already joined TODO improve with room sync
                 if let Err(x) = client.join_room_by_id(control_room.room_id()).await {
+                    log::debug!("{}", x);
+                }
+            }
+        }
+
+        if let Some(space_room) = self.get_space_room().await {
+            if client.get_joined_room(space_room.room_id()).is_none() {
+                // ignore result, if already invited TODO improve with room sync
+                if let Err(x) = space_room
+                    .invite_user_by_id(&client.user_id().await.unwrap())
+                    .await
+                {
+                    log::debug!("{}", x);
+                }
+                if let Err(x) = client.join_room_by_id(space_room.room_id()).await {
                     log::debug!("{}", x);
                 }
             }

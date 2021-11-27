@@ -12,19 +12,22 @@ use deltachat::{
 use matrix_sdk::{
     room::{Joined, Room},
     ruma::{
-        api::client::r0::message::send_message_event,
         api::client::r0::{
             membership::leave_room,
             room::create_room::{self, RoomPreset},
         },
+        api::client::r0::{message::send_message_event, room::create_room::CreationContent},
         events::{
             room::{
+                avatar::RoomAvatarEventContent,
+                create::RoomType,
                 message::{
                     FileInfo, FileMessageEventContent, ImageMessageEventContent, MessageType,
                     RoomMessageEventContent,
                 },
                 ImageInfo,
             },
+            space::child::SpaceChildEventContent,
             MessageEventContent,
         },
         serde::Raw,
@@ -34,7 +37,44 @@ use matrix_sdk::{
     Client, Result,
 };
 
-use crate::{types, DeltaAppservice};
+use crate::{types, compat, DeltaAppservice};
+
+pub async fn create_space(da: &DeltaAppservice, avatar_uri: Option<MxcUri>) -> Result<RoomId> {
+    let invite_user_ids = vec![da.get_owner_user_id().await];
+
+    let mut r = create_room::Request::new();
+    r.preset = Some(RoomPreset::TrustedPrivateChat);
+    r.creation_content = {
+        let mut cc = CreationContent::new();
+        cc.room_type = Some(RoomType::Space);
+        Some(Raw::new(&cc).unwrap())
+    };
+    r.name = Some("Delta Appservice".try_into().unwrap());
+    r.invite = invite_user_ids.as_slice();
+
+    let main_user = da.get_main_user();
+    let response = main_user.create_room(r).await.unwrap();
+    compat::fetch_initial_room_state(&main_user, &response.room_id).await.unwrap();
+
+    let space_room = main_user.get_joined_room(&response.room_id).unwrap();
+    let control_room_id = da.get_control_room_id().await.unwrap();
+    let space_child_event_content = {
+        let mut scec = SpaceChildEventContent::new();
+        let server_name = main_user.user_id().await.unwrap().server_name().to_owned();
+        scec.via = Some(vec![server_name]);
+        scec.suggested = Some(true);
+        scec
+    };
+    space_room
+        .send_state_event(space_child_event_content, control_room_id.as_str())
+        .await?;
+
+    let mut avatar_event = RoomAvatarEventContent::new();
+    avatar_event.url = avatar_uri;
+    space_room.send_state_event(avatar_event, "").await?;
+
+    Ok(response.room_id)
+}
 
 pub async fn create_room_for_chat(
     da: &DeltaAppservice,
@@ -86,6 +126,22 @@ pub async fn create_room_for_chat(
     chat.get_id().accept(&da.ctx).await.unwrap();
     da.set_room_id_with_chat_id(&response.room_id, chat.get_id())
         .await;
+
+    let space_room = da.get_space_room().await.unwrap();
+    let space_child_event_content = {
+        let mut scec = SpaceChildEventContent::new();
+        let server_name = create_client
+            .user_id()
+            .await
+            .unwrap()
+            .server_name()
+            .to_owned();
+        scec.via = Some(vec![server_name]);
+        scec
+    };
+    space_room
+        .send_state_event(space_child_event_content, response.room_id.as_str())
+        .await?;
 
     backfill_chat(da, &response.room_id, chat.get_id())
         .await
