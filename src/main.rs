@@ -48,7 +48,6 @@ use types::DeltaMessageFields;
 use dashmap::DashMap;
 
 mod cmdline;
-mod compat;
 mod intent;
 mod types;
 
@@ -153,16 +152,7 @@ impl DeltaAppservice {
         let main_user = self.get_main_user();
         if let Some(control_room_id) = control_room_id {
             log::info!("control room: {}", control_room_id);
-            let room = main_user.get_joined_room(&control_room_id);
-            if room.is_none() {
-                log::debug!("fetching control room state");
-                compat::fetch_initial_room_state(&main_user, &control_room_id)
-                    .await
-                    .unwrap();
-                let room = main_user.get_joined_room(&control_room_id);
-                return room;
-            }
-            room
+            main_user.get_joined_room(&control_room_id)
         } else {
             log::warn!("no control room configured!");
             None
