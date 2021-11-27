@@ -1,7 +1,7 @@
 use std::convert::TryFrom;
 
 use anyhow::Result;
-use deltachat::{chat::ChatId, config::Config};
+use deltachat::{chat::ChatId, config::Config, constants::Viewtype};
 use matrix_sdk::{
     room::{Joined, Room},
     ruma::{
@@ -13,10 +13,12 @@ use matrix_sdk::{
                     self, MessageType, RoomMessageEventContent, SyncRoomMessageEvent,
                     TextMessageEventContent,
                 },
-                topic::{RoomTopicEventContent, SyncRoomTopicEvent},
+                name::RoomNameEventContent,
+                topic::SyncRoomTopicEvent,
             },
             MessageEvent,
         },
+        identifiers::RoomNameBox,
         EventId, UserId,
     },
 };
@@ -84,7 +86,22 @@ async fn handle_chat_room_message(
     msg_body: String,
 ) -> Result<()> {
     if let Some(chat_id) = da.get_chat_id_by_room_id(room.room_id()).await {
-        let msg_id = deltachat::chat::send_text_msg(&da.ctx, chat_id, msg_body)
+        let mut msg = deltachat::message::Message::new(Viewtype::Text);
+        msg.set_text(Some(msg_body));
+        deltachat::chat::prepare_msg(&da.ctx, chat_id, &mut msg)
+            .await
+            .unwrap();
+        if !msg.has_in_reply_to() {
+            if let Some(topic) = room.topic() {
+                msg.set_subject(topic);
+                msg.update_subject(&da.ctx).await;
+            } else {
+                let msg = RoomMessageEventContent::text_plain("Must have topic");
+                room.send(msg, None).await?;
+                return Ok(());
+            }
+        }
+        let msg_id = deltachat::chat::send_msg(&da.ctx, chat_id, &mut msg)
             .await
             .unwrap();
         da.event_message_cache.insert(msg_id, event_id);
@@ -136,25 +153,17 @@ async fn handle_control_room_command_message(
     let args = shell_words::split(arguments).expect("must parse");
     if args.len() < 1 || !deltachat::contact::may_be_valid_addr(&args[0]) {
         let msg =
-            RoomMessageEventContent::text_plain("Usage: message <email> [full_name] [subject]");
+            RoomMessageEventContent::text_plain("Usage: message <email> [full_name]");
         control_room.send(msg, None).await?;
         return Ok(());
     }
 
     let addr = &args[0];
     let name = args.get(1).map(String::as_str).unwrap_or("");
-    let subject = args.get(2);
 
     let contact_id = deltachat::contact::Contact::create(&da.ctx, name, addr).await?;
     let chat_id = ChatId::create_for_contact(&da.ctx, contact_id).await?;
-    let room_id = matrix_intents::create_room_for_chat(&da, control_room, chat_id).await?;
-
-    if let Some(subject) = subject {
-        let topic_event = RoomTopicEventContent::new(subject.to_owned());
-        if let Some(room) = da.get_main_user().get_joined_room(&room_id) {
-            room.send_state_event(topic_event, "").await?;
-        }
-    }
+    matrix_intents::create_room_for_chat(&da, control_room, chat_id).await?;
 
     Ok(())
 }
@@ -443,10 +452,15 @@ async fn handle_room_main_user_invited(
         return Ok(());
     }
 
-    let client = da.get_main_user();
-    client.join_room_by_id(room.room_id()).await?;
+    let main_user = da.get_main_user();
+    main_user.join_room_by_id(room.room_id()).await?;
     da.set_control_room_id(room.room_id()).await?;
     da.set_owner_user_id(sender).await?;
+
+    let topic_event = RoomNameEventContent::new(RoomNameBox::try_from("Delta Control Room").ok());
+    if let Some(room) = main_user.get_joined_room(room.room_id()) {
+        room.send_state_event(topic_event, "").await?;
+    }
 
     Ok(())
 }

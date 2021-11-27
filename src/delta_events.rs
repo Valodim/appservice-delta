@@ -12,19 +12,19 @@ pub async fn callback_delta_event(da: &DeltaAppservice, event: EventType) {
     match event {
         EventType::IncomingMsg { chat_id, msg_id } => {
             log::info!("{:?}", event);
-            handle_chat_incoming_message(da, chat_id, msg_id)
+            handle_incoming_message(da, chat_id, msg_id)
                 .await
                 .unwrap();
         }
         EventType::MsgDelivered { chat_id, msg_id } => {
             log::info!("{:?}", event);
-            handle_chat_delivered_message(da, chat_id, msg_id)
+            handle_delivered_message(da, chat_id, msg_id)
                 .await
                 .unwrap();
         }
         EventType::MsgFailed { chat_id, msg_id } => {
             log::info!("{:?}", event);
-            handle_chat_failed_message(da, chat_id, msg_id)
+            handle_failed_message(da, chat_id, msg_id)
                 .await
                 .unwrap();
         }
@@ -34,7 +34,7 @@ pub async fn callback_delta_event(da: &DeltaAppservice, event: EventType) {
             contact_id,
         } => {
             log::info!("{:?}", event);
-            handle_chat_read_message(da, chat_id, msg_id, contact_id)
+            handle_read_message(da, chat_id, msg_id, contact_id)
                 .await
                 .unwrap();
         }
@@ -61,7 +61,7 @@ async fn handle_contact_changed(da: &DeltaAppservice, contact_id: u32) -> anyhow
     Ok(())
 }
 
-async fn handle_chat_delivered_message(
+async fn handle_delivered_message(
     da: &DeltaAppservice,
     chat_id: ChatId,
     msg_id: MsgId,
@@ -76,7 +76,7 @@ async fn handle_chat_delivered_message(
     Ok(())
 }
 
-async fn handle_chat_read_message(
+async fn handle_read_message(
     da: &DeltaAppservice,
     chat_id: ChatId,
     msg_id: MsgId,
@@ -94,7 +94,7 @@ async fn handle_chat_read_message(
     Ok(())
 }
 
-async fn handle_chat_incoming_message(
+async fn handle_incoming_message(
     da: &DeltaAppservice,
     chat_id: ChatId,
     msg_id: MsgId,
@@ -123,7 +123,7 @@ async fn handle_chat_incoming_message(
     Ok(())
 }
 
-async fn handle_chat_failed_message(
+async fn handle_failed_message(
     da: &DeltaAppservice,
     chat_id: ChatId,
     msg_id: MsgId,
