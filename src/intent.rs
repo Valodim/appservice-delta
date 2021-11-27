@@ -135,14 +135,20 @@ async fn send_delta_plain_message_content(
         msg,
     };
 
-    let event_id = send_message(client, room_id, content).await?;
+    let event_id = if let Some(room) = client.get_joined_room(room_id) {
+        room.send(content, None).await?.event_id
+    } else {
+        log::warn!("User {} not joined in room {}, falling back to send_message", client.user_id().await.unwrap(), room_id);
+        send_message(client, room_id, content).await?
+    };
+
     da.event_message_cache.insert(message.get_id().clone(), event_id);
 
     Ok(())
 }
 
 // TODO replace with room.send() once room sync is available
-pub async fn send_message(
+async fn send_message(
     client: &Client,
     room_id: &RoomId,
     content: impl MessageEventContent,
