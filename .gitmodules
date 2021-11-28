@@ -1,6 +1,6 @@
 [submodule "deltachat-core-rust"]
 	path = deltachat-core-rust
-	url = ./deltachat-core-rust
+	url = https://github.com/Valodim/deltachat-core-rust
 [submodule "matrix-rust-sdk"]
 	path = matrix-rust-sdk
-	url = ./matrix-rust-sdk
+	url = https://github.com/Valodim/matrix-rust-sdk
